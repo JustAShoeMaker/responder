@@ -48,6 +48,14 @@ If you want dynamic URLs, you can use Python's familiar *f-string syntax* to dec
 
 A ``GET`` request to ``/hello/brettcannon`` will result in a response of ``hello, brettcannon!``.
 
+Type convertors are also available::
+
+    @api.route("/add/{a:int}/{b:int}")
+    async def add(req, resp, *, a, b):
+        resp.text = f"{a} + {b} = {a + b}"
+
+Supported types: ``str``, ``int`` and ``float``.
+
 Returning JSON / YAML
 ---------------------
 
@@ -69,7 +77,7 @@ If you want to render a template, simply use ``api.template``. No need for addit
 
     @api.route("/hello/{who}/html")
     def hello_html(req, resp, *, who):
-        resp.content = api.template('hello.html', who=who)
+        resp.html = api.template('hello.html', who=who)
 
 The ``api`` instance is available as an object during template rendering.
 
@@ -124,3 +132,29 @@ Here, we'll process our data in the background, while responding immediately to 
         resp.media = {'success': True}
 
 A ``POST`` request to ``/incoming`` will result in an immediate response of ``{'success': true}``.
+
+
+Here's a sample code to post a file with background::
+
+    @api.route("/")
+    async def upload_file(req, resp):
+
+        @api.background.task
+        def process_data(data):
+            f = open('./{}'.format(data['file']['filename']), 'w')
+            f.write(data['file']['content'].decode('utf-8'))
+            f.close()
+
+        data = await req.media(format='files')
+        process_data(data)
+
+        resp.media = {'success': 'ok'}
+
+You can send a file easily with requests::
+
+	  import requests
+
+	  data = {'file': ('hello.txt', 'hello, world!', "text/plain")}
+	  r = requests.post('http://127.0.0.1:8210/file', files=data)
+
+	  print(r.text)

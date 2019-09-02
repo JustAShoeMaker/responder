@@ -12,14 +12,13 @@ import uvicorn
 import yaml
 from apispec import APISpec, yaml_utils
 from apispec.ext.marshmallow import MarshmallowPlugin
-from asgiref.wsgi import WsgiToAsgi
+from starlette.middleware.wsgi import WSGIMiddleware
 from starlette.middleware.errors import ServerErrorMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
-from starlette.middleware.lifespan import LifespanMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from starlette.routing import Router
+from starlette.routing import Lifespan
 from starlette.staticfiles import StaticFiles
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocket
@@ -46,6 +45,12 @@ class API:
         :param templates_dir: The directory to use for templates. Will be created for you if it doesn't already exist.
         :param auto_escape: If ``True``, HTML and XML templates will automatically be escaped.
         :param enable_hsts: If ``True``, send all responses to HTTPS URLs.
+        :param title: The title of the application (OpenAPI Info Object)
+        :param version: The version of the OpenAPI document (OpenAPI Info Object)
+        :param description: The description of the OpenAPI document (OpenAPI Info Object)
+        :param terms_of_service: A URL to the Terms of Service for the API (OpenAPI Info Object)
+        :param contact: The contact dictionary of the application (OpenAPI Contact Object)
+        :param license: The license information of the exposed API (OpenAPI License Object)
     """
 
     status_codes = status_codes
@@ -56,6 +61,10 @@ class API:
         debug=False,
         title=None,
         version=None,
+        description=None,
+        terms_of_service=None,
+        contact=None,
+        license=None,
         openapi=None,
         openapi_route="/schema.yml",
         static_dir="static",
@@ -74,14 +83,32 @@ class API:
         self.secret_key = secret_key
         self.title = title
         self.version = version
+        self.description = description
+        self.terms_of_service = terms_of_service
+        self.contact = contact
+        self.license = license
         self.openapi_version = openapi
-        self.static_dir = Path(os.path.abspath(static_dir))
+
+        if static_dir is not None:
+            if static_route is None:
+                static_route = static_dir
+            static_dir = Path(os.path.abspath(static_dir))
+
+        self.static_dir = static_dir
         self.static_route = static_route
-        self.templates_dir = Path(os.path.abspath(templates_dir))
+
         self.built_in_templates_dir = Path(
             os.path.abspath(os.path.dirname(__file__) + "/templates")
         )
+
+        if templates_dir is not None:
+            templates_dir = Path(os.path.abspath(templates_dir))
+
+        self.templates_dir = templates_dir or self.built_in_templates_dir
+
+        self.apps = {}
         self.routes = {}
+        self.before_requests = {"http": [], "ws": []}
         self.docs_theme = DEFAULT_API_THEME
         self.docs_route = docs_route
         self.schemas = {}
@@ -102,19 +129,23 @@ class API:
 
         # Make the static/templates directory if they don't exist.
         for _dir in (self.static_dir, self.templates_dir):
-            os.makedirs(_dir, exist_ok=True)
+            if _dir is not None:
+                os.makedirs(_dir, exist_ok=True)
 
-        self.whitenoise = WhiteNoise(application=self._default_wsgi_app)
-        self.whitenoise.add_files(str(self.static_dir))
+        if self.static_dir is not None:
+            self.whitenoise = WhiteNoise(application=self._notfound_wsgi_app)
+            self.whitenoise.add_files(str(self.static_dir))
 
-        self.whitenoise.add_files(
-            (
-                Path(apistar.__file__).parent / "themes" / self.docs_theme / "static"
-            ).resolve()
-        )
+            self.whitenoise.add_files(
+                (
+                    Path(apistar.__file__).parent
+                    / "themes"
+                    / self.docs_theme
+                    / "static"
+                ).resolve()
+            )
 
-        self.apps = {}
-        self.mount(self.static_route, self.whitenoise)
+            self.mount(self.static_route, self.whitenoise)
 
         self.formats = get_formats()
 
@@ -128,7 +159,7 @@ class API:
             self.add_route(self.docs_route, self.docs_response)
 
         self.default_endpoint = None
-        self.app = self.dispatch
+        self.app = self.asgi
         self.add_middleware(GZipMiddleware)
 
         if self.hsts_enabled:
@@ -136,13 +167,13 @@ class API:
 
         self.add_middleware(TrustedHostMiddleware, allowed_hosts=self.allowed_hosts)
 
-        self.lifespan_handler = LifespanMiddleware(self.app)
+        self.lifespan_handler = Lifespan()
 
         if self.cors:
             self.add_middleware(CORSMiddleware, **self.cors_params)
         self.add_middleware(ServerErrorMiddleware, debug=debug)
 
-        # Jinja enviroment
+        # Jinja environment
         self.jinja_env = jinja2.Environment(
             loader=jinja2.FileSystemLoader(
                 [str(self.templates_dir), str(self.built_in_templates_dir)],
@@ -156,25 +187,51 @@ class API:
         )  #: A Requests session that is connected to the ASGI app.
 
     @staticmethod
-    def _default_wsgi_app(*args, **kwargs):
+    def _default_wsgi_app(environ, start_response):
         pass
 
-    @property
-    def before_requests(self):
-        def gen():
-            for route in self.routes:
-                if self.routes[route].before_request:
-                    yield self.routes[route]
+    @staticmethod
+    def _notfound_wsgi_app(environ, start_response):
+        start_response("404 NOT FOUND", [("Content-Type", "text/plain")])
+        return [b"Not Found."]
 
-        return [g for g in gen()]
+    def before_request(self, websocket=False):
+        def decorator(f):
+            if websocket:
+                self.before_requests.setdefault("ws", []).append(f)
+            else:
+                self.before_requests.setdefault("http", []).append(f)
+            return f
+
+        return decorator
+
+    @property
+    def before_http_requests(self):
+        return self.before_requests.get("http", [])
+
+    @property
+    def before_ws_requests(self):
+        return self.before_requests.get("ws", [])
 
     @property
     def _apispec(self):
+
+        info = {}
+        if self.description is not None:
+            info["description"] = self.description
+        if self.terms_of_service is not None:
+            info["termsOfService"] = self.terms_of_service
+        if self.contact is not None:
+            info["contact"] = self.contact
+        if self.license is not None:
+            info["license"] = self.license
+
         spec = APISpec(
             title=self.title,
             version=self.version,
             openapi_version=self.openapi_version,
             plugins=[MarshmallowPlugin()],
+            info=info,
         )
 
         for route in self.routes:
@@ -196,9 +253,10 @@ class API:
     def add_middleware(self, middleware_cls, **middleware_config):
         self.app = middleware_cls(self.app, **middleware_config)
 
-    def __call__(self, scope):
+    async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
-            return self.lifespan_handler(scope)
+            await self.lifespan_handler(scope, receive, send)
+            return
 
         path = scope["path"]
         root_path = scope.get("root_path", "")
@@ -209,50 +267,62 @@ class API:
                 scope["path"] = path[len(path_prefix) :]
                 scope["root_path"] = root_path + path_prefix
                 try:
-                    return app(scope)
+                    await app(scope, receive, send)
+                    return
                 except TypeError:
-                    app = WsgiToAsgi(app)
-                    return app(scope)
+                    app = WSGIMiddleware(app)
+                    await app(scope, receive, send)
+                    return
 
-        return self.app(scope)
+        await self.app(scope, receive, send)
 
-    def dispatch(self, scope):
-        # Call the main dispatcher.
-        async def asgi(receive, send):
-            nonlocal scope, self
+    async def asgi(self, scope, receive, send):
+        assert scope["type"] in ("http", "websocket")
 
-            if scope["type"] == "websocket":
-                ws = WebSocket(scope=scope, receive=receive, send=send)
-                await self._dispatch_ws(ws)
-            else:
-                req = models.Request(scope, receive=receive, api=self)
-                resp = await self._dispatch_request(
-                    req, scope=scope, send=send, receive=receive
-                )
-                await resp(receive, send)
+        if scope["type"] == "websocket":
+            await self._dispatch_ws(scope=scope, receive=receive, send=send)
+        else:
+            req = models.Request(scope, receive=receive, api=self)
+            resp = await self._dispatch_http(
+                req, scope=scope, send=send, receive=receive
+            )
+            await resp(scope, receive, send)
 
-        return asgi
+    async def _dispatch_http(self, req, **options):
+        # Set formats on Request object.
+        req.formats = self.formats
 
-    async def _dispatch_ws(self, ws):
+        # Get the route.
+        route = self.path_matches_route(req.url.path)
+        route = self.routes.get(route)
+        if route:
+            resp = models.Response(req=req, formats=self.formats)
+
+            for before_request in self.before_http_requests:
+                await self.background(before_request, req=req, resp=resp)
+
+            await self._execute_route(route=route, req=req, resp=resp, **options)
+        else:
+            resp = models.Response(req=req, formats=self.formats)
+            self.default_response(req=req, resp=resp, notfound=True)
+        self.default_response(req=req, resp=resp)
+
+        self._prepare_session(resp)
+
+        return resp
+
+    async def _dispatch_ws(self, scope, receive, send):
+        ws = WebSocket(scope=scope, receive=receive, send=send)
+
         route = self.path_matches_route(ws.url.path)
         route = self.routes.get(route)
-        # await self._dispatch(route, ws=ws)
-        try:
-            try:
-                # Run the view.
-                r = self.background(route.endpoint, ws)
-                # If it's async, await it.
-                if hasattr(r, "cr_running"):
-                    await r
-            except TypeError as e:
-                cont = True
-        except Exception:
-            self.background(
-                self.default_response,
-                websocket=route.uses_websocket,
-                error=True
-            )
-            raise
+
+        if route:
+            for before_request in self.before_ws_requests:
+                await self.background(before_request, ws=ws)
+            await self.background(route.endpoint, ws)
+        else:
+            await send({"type": "websocket.close", "code": 1000})
 
     def add_schema(self, name, schema, check_existing=True):
         """Adds a mashmallow schema to the API specification."""
@@ -289,11 +359,6 @@ class API:
             if route_object.does_match(path):
                 return route
 
-    def _prepare_cookies(self, resp):
-        if resp.cookies:
-            header = " ".join([f"{k}={v};" for k, v in resp.cookies.items()])
-            resp.headers["Set-Cookie"] = header
-
     @property
     def _signer(self):
         return itsdangerous.Signer(self.secret_key)
@@ -309,30 +374,6 @@ class API:
     @staticmethod
     def no_response(req, resp, **params):
         pass
-
-    async def _dispatch_request(self, req, **options):
-        # Set formats on Request object.
-        req.formats = self.formats
-
-        # Get the route.
-        route = self.path_matches_route(req.url.path)
-        route = self.routes.get(route)
-        if route:
-            resp = models.Response(req=req, formats=self.formats)
-
-            for before_request in self.before_requests:
-                await self._execute_route(route=before_request, req=req, resp=resp)
-
-            await self._execute_route(route=route, req=req, resp=resp, **options)
-        else:
-            resp = models.Response(req=req, formats=self.formats)
-            self.default_response(req=req, resp=resp, notfound=True)
-        self.default_response(req=req, resp=resp)
-
-        self._prepare_session(resp)
-        self._prepare_cookies(resp)
-
-        return resp
 
     async def _execute_route(self, *, route, req, resp, **options):
 
@@ -351,7 +392,7 @@ class API:
                 except TypeError as e:
                     cont = True
             except Exception:
-                self.background(self.default_response, req, resp, error=True)
+                await self.background(self.default_response, req, resp, error=True)
                 raise
 
         if route.is_class_based or cont:
@@ -385,7 +426,7 @@ class API:
                 # If it's async, await it.
                 if hasattr(r, "send"):
                     await r
-            except Exception as e:
+            except Exception:
                 await self.background(self.default_response, req, resp, error=True)
                 raise
 
@@ -417,22 +458,29 @@ class API:
         :param static: If ``True``, and no endpoint was passed, render "static/index.html", and it will become a default route.
         :param check_existing: If ``True``, an AssertionError will be raised, if the route is already defined.
         """
+        if before_request:
+            if websocket:
+                self.before_requests.setdefault("ws", []).append(endpoint)
+            else:
+                self.before_requests.setdefault("http", []).append(endpoint)
+            return
+
         if route is None:
             route = f"/{uuid4().hex}"
 
         if check_existing:
             assert route not in self.routes
 
-        if not endpoint and static:
-            endpoint = self.static_response
-            default = True
+        if static:
+            assert self.static_dir is not None
+            if not endpoint:
+                endpoint = self.static_response
+                default = True
 
         if default:
             self.default_endpoint = endpoint
 
-        self.routes[route] = Route(
-            route, endpoint, websocket=websocket, before_request=before_request
-        )
+        self.routes[route] = Route(route, endpoint, websocket=websocket)
         # TODO: A better data structure or sort it once the app is loaded
         self.routes = dict(
             sorted(self.routes.items(), key=lambda item: item[1]._weight())
@@ -458,14 +506,19 @@ class API:
                 resp.text = "Application error."
 
     def docs_response(self, req, resp):
-        resp.text = self.docs
+        resp.html = self.docs
 
     def static_response(self, req, resp):
+
+        assert self.static_dir is not None
+
         index = (self.static_dir / "index.html").resolve()
-        resp.content = None
         if os.path.exists(index):
             with open(index, "r") as f:
-                resp.text = f.read()
+                resp.html = f.read()
+        else:
+            resp.status_code = status_codes.HTTP_404
+            resp.text = "Not found."
 
     def schema_response(self, req, resp):
         resp.status_code = status_codes.HTTP_200
@@ -492,7 +545,7 @@ class API:
 
     def on_event(self, event_type: str, **args):
         """Decorator for registering functions or coroutines to run at certain events
-        Supported events: startup, cleanup, shutdown, tick
+        Supported events: startup, shutdown
 
         Usage::
 
@@ -500,11 +553,7 @@ class API:
             async def open_database_connection_pool():
                 ...
 
-            @api.on_event('tick', seconds=10)
-            async def do_stuff():
-                ...
-
-            @api.on_event('cleanup')
+            @api.on_event('shutdown')
             async def close_database_connection_pool():
                 ...
 
@@ -552,17 +601,15 @@ class API:
         return self._session
 
     def _route_for(self, endpoint):
-        for (route, route_object) in self.routes.items():
-            if route_object.endpoint == endpoint:
-                return route_object
-            elif route_object.endpoint_name == endpoint:
+        for route_object in self.routes.values():
+            if endpoint in (route_object.endpoint, route_object.endpoint_name):
                 return route_object
 
     def url_for(self, endpoint, **params):
         # TODO: Absolute_url
         """Given an endpoint, returns a rendered URL for its route.
 
-        :param view: The route endpoint you're searching for.
+        :param endpoint: The route endpoint you're searching for.
         :param params: Data to pass into the URL generator (for parameterized URLs).
         """
         route_object = self._route_for(endpoint)
@@ -572,6 +619,7 @@ class API:
 
     def static_url(self, asset):
         """Given a static asset, return its URL path."""
+        assert None not in (self.static_dir, self.static_route)
         return f"{self.static_route}/{str(asset)}"
 
     @property
@@ -590,15 +638,11 @@ class API:
 
         template = env.get_template("/".join([self.docs_theme, "index.html"]))
 
-        def static_url(asset):
-            return f"{self.static_route}/{asset}"
-            # return asset
-
         return template.render(
             document=document,
             langs=["javascript", "python"],
             code_style=None,
-            static_url=static_url,
+            static_url=self.static_url,
             schema_url="/schema.yml",
         )
 
@@ -657,6 +701,6 @@ class API:
         spawn()
 
     def run(self, **kwargs):
-        if 'debug' not in kwargs:
-            kwargs.update({'debug': self.debug})
+        if "debug" not in kwargs:
+            kwargs.update({"debug": self.debug})
         self.serve(**kwargs)

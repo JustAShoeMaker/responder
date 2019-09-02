@@ -2,11 +2,15 @@ import concurrent
 
 import pytest
 import yaml
+import random
 import responder
 import requests
+import string
 import io
 
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import PlainTextResponse
+from starlette.testclient import TestClient as StarletteTestClient
 
 
 def test_api_basic_route(api):
@@ -123,7 +127,7 @@ def test_yaml_media(api):
     r = api.requests.get("http://;/", headers={"Accept": "yaml"})
 
     assert "yaml" in r.headers["Content-Type"]
-    assert yaml.load(r.content) == dump
+    assert yaml.load(r.content, Loader=yaml.FullLoader) == dump
 
 
 def test_graphql_schema_query_querying(api, schema):
@@ -219,7 +223,7 @@ def test_media_parsing(api):
     assert r.json() == dump
 
     r = api.requests.get(api.url_for(route), headers={"Accept": "application/x-yaml"})
-    assert r.text == "{hello: sam}\n"
+    assert r.text == "hello: sam\n"
 
 
 def test_background(api):
@@ -302,6 +306,11 @@ def test_form_uploads(api):
     r = api.requests.post(api.url_for(route), data=dump)
     assert r.json() == dump
 
+    # requests with boundary
+    files = {"complicated": (None, "times")}
+    r = api.requests.post(api.url_for(route), files=files)
+    assert r.json() == {"complicated": "times"}
+
 
 def test_json_downloads(api):
     dump = {"testing": "123"}
@@ -334,7 +343,7 @@ def test_schema_generation():
     from marshmallow import Schema, fields
 
     api = responder.API(
-        title="Web Service", openapi="3.0", allowed_hosts=["testserver", ";"]
+        title="Web Service", openapi="3.0.2", allowed_hosts=["testserver", ";"]
     )
 
     @api.schema("Pet")
@@ -351,7 +360,7 @@ def test_schema_generation():
                 200:
                     description: A pet to be returned
                     schema:
-                        $ref = "#/components/schemas/Pet"
+                        $ref: "#/components/schemas/Pet"
         """
         resp.media = PetSchema().dump({"name": "little orange"})
 
@@ -359,17 +368,34 @@ def test_schema_generation():
     dump = yaml.safe_load(r.content)
 
     assert dump
-    assert dump["openapi"] == "3.0"
+    assert dump["openapi"] == "3.0.2"
 
 
 def test_documentation():
     import responder
     from marshmallow import Schema, fields
 
+    description = "This is a sample server for a pet store."
+    terms_of_service = "http://example.com/terms/"
+    contact = {
+        "name": "API Support",
+        "url": "http://www.example.com/support",
+        "email": "support@example.com",
+    }
+    license = {
+        "name": "Apache 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
+    }
+
     api = responder.API(
         title="Web Service",
-        openapi="3.0",
+        version="1.0",
+        openapi="3.0.2",
         docs_route="/docs",
+        description=description,
+        terms_of_service=terms_of_service,
+        contact=contact,
+        license=license,
         allowed_hosts=["testserver", ";"],
     )
 
@@ -387,7 +413,7 @@ def test_documentation():
                 200:
                     description: A pet to be returned
                     schema:
-                        $ref = "#/components/schemas/Pet"
+                        $ref: "#/components/schemas/Pet"
         """
         resp.media = PetSchema().dump({"name": "little orange"})
 
@@ -422,13 +448,23 @@ def test_cookies(api):
     def cookies(req, resp):
         resp.media = {"cookies": req.cookies}
         resp.cookies["sent"] = "true"
+        resp.set_cookie(
+            "hello",
+            "world",
+            expires=123,
+            path="/",
+            max_age=123,
+            secure=False,
+            httponly=True,
+        )
 
     r = api.requests.get(api.url_for(cookies), cookies={"hello": "universe"})
     assert r.json() == {"cookies": {"hello": "universe"}}
     assert "sent" in r.cookies
+    assert "hello" in r.cookies
 
     r = api.requests.get(api.url_for(cookies))
-    assert r.json() == {"cookies": {"sent": "true"}}
+    assert r.json() == {"cookies": {"hello": "world", "sent": "true"}}
 
 
 @pytest.mark.xfail
@@ -439,11 +475,11 @@ def test_sessions(api):
         resp.media = resp.session
 
     r = api.requests.get(api.url_for(view))
-    assert "Responder-Session" in r.cookies
+    assert api.session_cookie in r.cookies
 
     r = api.requests.get(api.url_for(view))
     assert (
-        r.cookies["Responder-Session"]
+        r.cookies[api.session_cookie]
         == '{"hello": "world"}.r3EB04hEEyLYIJaAXCEq3d4YEbs'
     )
     assert r.json() == {"hello": "world"}
@@ -479,8 +515,9 @@ def test_500(api):
     def view(req, resp):
         raise ValueError
 
-    dumb_client = responder.api.TestClient(api, base_url="http://;",
-                                           raise_server_exceptions=False)
+    dumb_client = responder.api.TestClient(
+        api, base_url="http://;", raise_server_exceptions=False
+    )
     r = dumb_client.get(api.url_for(view))
     assert not r.ok
     assert r.status_code == responder.status_codes.HTTP_500
@@ -492,16 +529,73 @@ def test_404(api):
     assert r.status_code == responder.status_codes.HTTP_404
 
 
-def test_kinda_websockets(api):
+def test_websockets_text(api):
+    payload = "Hello via websocket!"
+
     @api.route("/ws", websocket=True)
     async def websocket(ws):
         await ws.accept()
-        await ws.send_text("Hello via websocket!")
+        await ws.send_text(payload)
         await ws.close()
 
+    client = StarletteTestClient(api)
+    with client.websocket_connect("ws://;/ws") as websocket:
+        data = websocket.receive_text()
+        assert data == payload
 
-@pytest.mark.xfail
-def test_startup(api, session):
+
+def test_websockets_bytes(api):
+    payload = b"Hello via websocket!"
+
+    @api.route("/ws", websocket=True)
+    async def websocket(ws):
+        await ws.accept()
+        await ws.send_bytes(payload)
+        await ws.close()
+
+    client = StarletteTestClient(api)
+    with client.websocket_connect("ws://;/ws") as websocket:
+        data = websocket.receive_bytes()
+        assert data == payload
+
+
+def test_websockets_json(api):
+    payload = {"Hello": "via websocket!"}
+
+    @api.route("/ws", websocket=True)
+    async def websocket(ws):
+        await ws.accept()
+        await ws.send_json(payload)
+        await ws.close()
+
+    client = StarletteTestClient(api)
+    with client.websocket_connect("ws://;/ws") as websocket:
+        data = websocket.receive_json()
+        assert data == payload
+
+
+def test_before_websockets(api):
+    payload = {"Hello": "via websocket!"}
+
+    @api.route("/ws", websocket=True)
+    async def websocket(ws):
+        await ws.send_json(payload)
+        await ws.close()
+
+    @api.route(before_request=True, websocket=True)
+    async def before_request(ws):
+        await ws.accept()
+        await ws.send_json({"before": "request"})
+
+    client = StarletteTestClient(api)
+    with client.websocket_connect("ws://;/ws") as websocket:
+        data = websocket.receive_json()
+        assert data == {"before": "request"}
+        data = websocket.receive_json()
+        assert data == payload
+
+
+def test_startup(api):
     who = [None]
 
     @api.route("/{greeting}")
@@ -509,19 +603,12 @@ def test_startup(api, session):
         resp.text = f"{greeting}, {who[0]}!"
 
     @api.on_event("startup")
-    async def asd():
+    async def run_startup():
         who[0] = "world"
-        print("startup")
 
-    @api.on_event("cleanup")
-    async def asd():
-        print("cleanup")
-
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-    f = pool.submit(api.run)
-
-    r = requests.get(f"http://localhost:5042/hello")
-    assert r.text == "hello, world!"
+    with api.requests as session:
+        r = session.get(f"http://;/hello")
+        assert r.text == "hello, world!"
 
 
 def test_redirects(api, session):
@@ -610,3 +697,210 @@ def test_allowed_hosts():
     api._session = None
     r = api.session(base_url="http://tenant2.;").get(api.url_for(get))
     assert r.status_code == 200
+
+
+def create_asset(static_dir, name=None, parent_dir=None):
+    if name is None:
+        name = random.choices(string.ascii_letters, k=6)
+        # :3
+        ext = random.choices(string.ascii_letters, k=2)
+        name = f"{name}.{ext}"
+
+    if parent_dir is None:
+        parent_dir = static_dir
+    else:
+        parent_dir = static_dir.mkdir(parent_dir)
+
+    asset = parent_dir.join(name)
+    asset.write("body { color: blue; }")
+    return asset
+
+
+def test_staticfiles(tmpdir):
+    static_dir = tmpdir.mkdir("static")
+
+    asset1 = create_asset(static_dir)
+    parent_dir = "css"
+    asset2 = create_asset(static_dir, name="asset2", parent_dir=parent_dir)
+
+    api = responder.API(static_dir=str(static_dir))
+    session = api.session()
+
+    static_route = api.static_route
+
+    # ok
+    r = session.get(f"{static_route}/{asset1.basename}")
+    assert r.status_code == api.status_codes.HTTP_200
+
+    r = session.get(f"{static_route}/{parent_dir}/{asset2.basename}")
+    assert r.status_code == api.status_codes.HTTP_200
+
+    # Asset not found
+    r = session.get(f"{static_route}/not_found.css")
+    assert r.status_code == api.status_codes.HTTP_404
+
+    # Not found on dir listing
+    r = session.get(f"{static_route}")
+    assert r.status_code == api.status_codes.HTTP_404
+
+    r = session.get(f"{static_route}/{parent_dir}")
+    assert r.status_code == api.status_codes.HTTP_404
+
+
+def test_staticfiles_custom_route(tmpdir):
+    static_dir = tmpdir.mkdir("static")
+    static_route = "/custom/static/route"
+
+    asset = create_asset(static_dir)
+
+    api = responder.API(static_dir=str(static_dir), static_route=static_route)
+    session = api.session()
+
+    static_route = api.static_route
+
+    # ok
+    r = session.get(f"{static_route}/{asset.basename}")
+    assert r.status_code == api.status_codes.HTTP_200
+
+    # Asset not found
+    r = session.get(f"{static_route}/not_found.css")
+    assert r.status_code == api.status_codes.HTTP_404
+
+    # Not found on dir listing
+    r = session.get(f"{static_route}")
+    assert r.status_code == api.status_codes.HTTP_404
+
+
+def test_staticfiles_none_dir(tmpdir):
+    api = responder.API(static_dir=None)
+    session = api.session()
+
+    static_dir = tmpdir.mkdir("static")
+
+    asset = create_asset(static_dir)
+
+    static_route = api.static_route
+
+    # ok
+    r = session.get(f"{static_route}/{asset.basename}")
+    assert r.status_code == api.status_codes.HTTP_404
+
+    # dir listing
+    r = session.get(f"{static_route}")
+    assert r.status_code == api.status_codes.HTTP_404
+
+    # SPA
+    with pytest.raises(Exception) as excinfo:
+        api.add_route("/spa", static=True)
+
+
+def test_staticfiles_none_dir_route(tmpdir):
+    api = responder.API(static_dir=None, static_route=None)
+    session = api.session()
+
+    static_dir = tmpdir.mkdir("static")
+
+    asset = create_asset(static_dir)
+
+    static_route = api.static_route
+
+    # ok
+    r = session.get(f"{static_route}/{asset.basename}")
+    assert r.status_code == api.status_codes.HTTP_404
+
+    # dir listing
+    r = session.get(f"{static_route}")
+    assert r.status_code == api.status_codes.HTTP_404
+
+
+def test_response_html_property(api):
+    @api.route("/")
+    def view(req, resp):
+        resp.html = "<h1>Hello !</h1>"
+
+        assert resp.content == "<h1>Hello !</h1>"
+        assert resp.mimetype == "text/html"
+
+    r = api.requests.get(api.url_for(view))
+    assert r.content == b"<h1>Hello !</h1>"
+    assert r.headers["Content-Type"] == "text/html"
+
+
+def test_response_text_property(api):
+    @api.route("/")
+    def view(req, resp):
+        resp.text = "<h1>Hello !</h1>"
+
+        assert resp.content == "<h1>Hello !</h1>"
+        assert resp.mimetype == "text/plain"
+
+    r = api.requests.get(api.url_for(view))
+    assert r.content == b"<h1>Hello !</h1>"
+    assert r.headers["Content-Type"] == "text/plain"
+
+
+def test_stream(api, session):
+    async def shout_stream(who):
+        for c in who.upper():
+            yield c
+
+    @api.route("/{who}")
+    async def greeting(req, resp, *, who):
+
+        resp.stream(shout_stream, who)
+
+    r = session.get("/morocco")
+    assert r.text == "MOROCCO"
+
+    @api.route("/")
+    async def home(req, resp):
+        # Raise when it's not an async generator
+        with pytest.raises(AssertionError):
+
+            def foo():
+                pass
+
+            resp.stream(foo)
+
+        with pytest.raises(AssertionError):
+
+            async def foo():
+                pass
+
+            resp.stream(foo)
+
+        with pytest.raises(AssertionError):
+
+            def foo():
+                yield "oopsie"
+
+            resp.stream(foo)
+
+
+def test_empty_req_text(api):
+    content = "It's working"
+
+    @api.route("/")
+    async def home(req, resp):
+        await req.text
+        resp.text = content
+
+    r = api.requests.post("/")
+    assert r.text == content
+
+    def test_api_request_state(api, url):
+        class StateMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                request.state.test1 = 42
+                request.state.test2 = "Foo"
+
+                response = await call_next(request)
+                return response
+
+        api.add_middleware(StateMiddleware)
+
+        @api.route("/")
+        def home(req, resp):
+            resp.text = "{}_{}".format(req.state.test2, req.state.test1)
+
+        assert api.requests.get(url("/")).text == "Foo_42"

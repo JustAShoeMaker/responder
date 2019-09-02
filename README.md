@@ -1,11 +1,11 @@
 # Responder: a familiar HTTP Service Framework for Python
 
-[![Build Status](https://travis-ci.org/kennethreitz/responder.svg?branch=master)](https://travis-ci.org/kennethreitz/responder)
+[![Build Status](https://travis-ci.org/taoufik07/responder.svg?branch=master)](https://travis-ci.org/taoufik07/responder)
 [![Documentation Status](https://readthedocs.org/projects/mybinder/badge/?version=latest)](https://responder.readthedocs.io/en/latest/)
 [![image](https://img.shields.io/pypi/v/responder.svg)](https://pypi.org/project/responder/)
 [![image](https://img.shields.io/pypi/l/responder.svg)](https://pypi.org/project/responder/)
 [![image](https://img.shields.io/pypi/pyversions/responder.svg)](https://pypi.org/project/responder/)
-[![image](https://img.shields.io/github/contributors/kennethreitz/responder.svg)](https://github.com/kennethreitz/responder/graphs/contributors)
+[![image](https://img.shields.io/github/contributors/taoufik07/responder.svg)](https://github.com/taoufik07/responder/graphs/contributors)
 
 [![](https://farm2.staticflickr.com/1959/43750081370_a4e20752de_o_d.png)](https://python-responder.org/)
 
@@ -31,16 +31,16 @@ See [the documentation's feature tour](https://python-responder.org/en/latest/to
 
 # Installing Responder
 
-Install the latest release:
+Install the stable release:
 
 
-    $ pipenv install responder --pre
+    $ pipenv install responder
     ✨🍰✨
 
 
 Or, install from the development branch:
 
-    $ pipenv install -e git+https://github.com/kennethreitz/responder.git#egg=responder
+    $ pipenv install -e git+https://github.com/taoufik07/responder.git#egg=responder
 
 Only **Python 3.6+** is supported.
 
@@ -49,10 +49,12 @@ Only **Python 3.6+** is supported.
 
 The primary concept here is to bring the niceties that are brought forth from both Flask and Falcon and unify them into a single framework, along with some new ideas I have. I also wanted to take some of the API primitives that are instilled in the Requests library and put them into a web framework. So, you'll find a lot of parallels here with Requests.
 
-- Setting `resp.text` sends back unicode, while setting `resp.content` sends back bytes.
-- Setting `resp.media` sends back JSON/YAML (`.text`/`.content` override this).
+- Setting `resp.content` sends back bytes.
+- Setting `resp.text` sends back unicode, while setting `resp.html` sends back HTML.
+- Setting `resp.media` sends back JSON/YAML (`.text`/`.html`/`.content` override this).
 - Case-insensitive `req.headers` dict (from Requests directly).
 - `resp.status_code`, `req.method`, `req.url`, and other familiar friends.
+
 
 ## Ideas
 
@@ -66,8 +68,3 @@ The primary concept here is to bring the niceties that are brought forth from bo
 - Uvicorn built-in as a production web server. I would have chosen Gunicorn, but it doesn't run on Windows. Plus, Uvicorn serves well to protect against slowloris attacks, making nginx unnecessary in production.
 - GraphQL support, via Graphene. The goal here is to have any GraphQL query exposable at any route, magically.
 - Provide an official way to run webpack.
-
-
-----------
-
-[![hacktoberfest](https://hacktoberfest.digitalocean.com/assets/hacktoberfest-2018-social-card-c8d2e1489f647f2e0a26e6f598adeb760872818905b34cd437afc7ac2857ceab.png)](https://hacktoberfest.digitalocean.com/)

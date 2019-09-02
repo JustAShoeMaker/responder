@@ -52,6 +52,8 @@ Serve a GraphQL API::
 
 Visiting the endpoint will render a *GraphiQL* instance, in the browser.
 
+You can make use of Responder's Request and Response objects in your GraphQL resolvers through ``info.context['request']`` and ``info.context['response']``.
+
 
 OpenAPI Schema Support
 ----------------------
@@ -61,7 +63,27 @@ Responder comes with built-in support for OpenAPI / marshmallow::
     import responder
     from marshmallow import Schema, fields
 
-    api = responder.API(title="Web Service", version="1.0", openapi="3.0.0")
+    description = "This is a sample server for a pet store."
+    terms_of_service = "http://example.com/terms/"
+    contact = {
+        "name": "API Support",
+        "url": "http://www.example.com/support",
+        "email": "support@example.com",
+    }
+    license = {
+        "name": "Apache 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
+    }
+
+    api = responder.API(
+        title="Web Service",
+        version="1.0",
+        openapi="3.0.2",
+        description=description,
+        terms_of_service=terms_of_service,
+        contact=contact,
+        license=license,
+    )
 
 
     @api.schema("Pet")
@@ -78,8 +100,10 @@ Responder comes with built-in support for OpenAPI / marshmallow::
             responses:
                 200:
                     description: A pet to be returned
-                    schema:
-                        $ref = "#/components/schemas/Pet"
+                    content:  
+                        application/json: 
+                            schema: 
+                                $ref: '#/components/schemas/Pet'                         
         """
         resp.media = PetSchema().dump({"name": "little orange"})
 
@@ -90,20 +114,28 @@ Responder comes with built-in support for OpenAPI / marshmallow::
 
     >>> print(r.text)
     components:
-    parameters: {}
-    schemas:
+      parameters: {}
+      responses: {}
+      schemas:
         Pet:
-        properties:
+          properties:
             name: {type: string}
-        type: object
-    info: {title: Web Service, version: 1.0}
-    openapi: '3.0'
+          type: object
+      securitySchemes: {}
+    info:
+      contact: {email: support@example.com, name: API Support, url: 'http://www.example.com/support'}
+      description: This is a sample server for a pet store.
+      license: {name: Apache 2.0, url: 'https://www.apache.org/licenses/LICENSE-2.0.html'}
+      termsOfService: http://example.com/terms/
+      title: Web Service
+      version: 1.0
+    openapi: 3.0.2
     paths:
       /:
         get:
           description: Get a random pet
           responses:
-            200: {description: A pet to be returned, schema: $ref = "#/components/schemas/Pet"}
+            200: {description: A pet to be returned, schema: $ref: "#/components/schemas/Pet"}
     tags: []
 
 
@@ -112,7 +144,16 @@ Interactive Documentation
 
 Responder can automatically supply API Documentation for you. Using the example above::
 
-    api = responder.API(title="Web Service", version="1.0", openapi="3.0.0", docs_route="/docs")
+    api = responder.API(
+        title="Web Service",
+        version="1.0",
+        openapi="3.0.2",
+        docs_route='/docs',
+        description=description,
+        terms_of_service=terms_of_service,
+        contact=contact,
+        license=license,
+    )
 
 This will make ``/docs`` render interactive documentation for your API.
 
@@ -155,6 +196,24 @@ Responder makes it very easy to interact with cookies from a Request, or add som
     {"hello": "world"}
 
 
+To set cookies directives, you should use `resp.set_cookie`::
+
+    >>> resp.set_cookie("hello", value="world", max_age=60)
+
+Supported directives:
+
+* ``key`` - **Required**
+* ``value`` - [OPTIONAL] - Defaults to ``""``. 
+* ``expires`` - Defaults to ``None``.
+* ``max_age`` - Defaults to ``None``.
+* ``domain`` - Defaults to ``None``.
+* ``path`` - Defaults to ``"/"``.
+* ``secure`` - Defaults to ``False``.
+* ``httponly`` - Defaults to ``True``.
+
+For more information see `directives <https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie#Directives>`_
+
+
 Using Cookie-Based Sessions
 ---------------------------
 
@@ -183,6 +242,41 @@ If you'd like a view to be executed before every request, simply do the followin
         resp.headers["X-Pizza"] = "42"
 
 Now all requests to your HTTP Service will include an ``X-Pizza`` header.
+
+For ``websockets``::
+
+    @api.route(before_request=True, websocket=True)
+    def prepare_response(ws):
+        await ws.accept()
+
+
+WebSocket Support
+-----------------
+
+Responder supports WebSockets::
+
+    @api.route('/ws', websocket=True)
+    async def websocket(ws):
+        await ws.accept()
+        while True:
+            name = await ws.receive_text()
+            await ws.send_text(f"Hello {name}!")
+        await ws.close()
+
+Accepting the connection::
+
+    await websocket.accept()
+
+Sending and receiving data::
+
+    await websocket.send_{format}(data) 
+    await websocket.receive_{format}(data)
+
+Supported formats: ``text``, ``json``, ``bytes``.
+
+Closing the connection::
+
+    await websocket.close()
 
 Using Requests Test Client
 --------------------------
@@ -250,7 +344,7 @@ A 400 response will be raised, if a request does not match any of the provided p
 
 ::
 
-    api = responder.API(allowed_hosts=[example.com, tenant.example.com])
+    api = responder.API(allowed_hosts=['example.com', 'tenant.example.com'])
 
 * ``allowed_hosts`` - A list of allowed hostnames. 
 
